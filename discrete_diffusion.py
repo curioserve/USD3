@@ -153,6 +153,17 @@ class UnifiedDiscreteDiffusion:
         self.transition_beta = transition_beta
         self.simplified_max_val = simplified_max_val
 
+        # Initialize S_t as a learnable parameter
+        self.S_t = torch.nn.Parameter(
+            torch.eye(num_classes) + 0.01 * torch.randn(num_classes, num_classes),
+            requires_grad=True
+        )
+        self._normalize_S_t()  # Ensure S_t is a valid transition matrix
+
+    def _normalize_S_t(self):
+        """Normalize S_t to ensure rows sum to 1."""
+        with torch.no_grad():
+            self.S_t.data = F.normalize(self.S_t.data, p=1, dim=-1)
   
     @torch.no_grad()
     def get_alphabar_beta(self, t, s=None): 
@@ -237,11 +248,11 @@ class UnifiedDiscreteDiffusion:
         else:
             m = m.mean(dim=tuple(range(m.dim() - 1)))  # Average over spatial dimensions
 
-        # Create structured transition matrix S
-        S = create_structured_transition_matrix(self.num_classes, m, self.transition_sigma, x_0.device)
+        # Use learnable S_t
+        S_t = self.S_t.to(x_0.device)
 
-        # Combine S and m
-        transition_mix = (1 - self.transition_beta) * S + self.transition_beta * m[None, :]
+        # Combine S_t and m
+        transition_mix = (1 - self.transition_beta) * S_t + self.transition_beta * m[None, :]
 
         # Sample from the combined distribution
         m0 = sample_categorical(transition_mix[x_0])
@@ -276,11 +287,11 @@ class UnifiedDiscreteDiffusion:
         else:
             m = m.mean(dim=tuple(range(m.dim() - 1)))  # Average over spatial dimensions
 
-        # Create structured transition matrix S
-        S = create_structured_transition_matrix(self.num_classes, m, self.transition_sigma, x_0.device)
+        # Use learnable S_t
+        S_t = self.S_t.to(x_0.device)
 
-        # Combine S and m
-        transition_mix = (1 - self.transition_beta) * S + self.transition_beta * m[None, :]
+        # Combine S_t and m
+        transition_mix = (1 - self.transition_beta) * S_t + self.transition_beta * m[None, :]
 
         # Compute full probability
         prob = (1 - alphabar_t) * transition_mix[x_0]  # (B, N1, ..., Nk, C)
@@ -289,7 +300,7 @@ class UnifiedDiscreteDiffusion:
         if return_beta:
             return prob, beta_t
         return prob
-
+    
     @torch.no_grad()
     def qs_t0_prob(self, x_t, x_0, t, s, m=None):
         """
