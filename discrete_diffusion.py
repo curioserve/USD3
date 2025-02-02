@@ -5,6 +5,25 @@ import math
 EPS = 1e-30
 LOG_EPS = math.log(EPS)
 
+
+
+def create_structured_transition_matrix(num_classes, m, sigma=1.0, device="cuda"):
+    """
+    Creates structured transition matrix S where S[i][j] decays with distance between i and j.
+    - m: Stationary distribution (C,)
+    - sigma: Controls neighborhood size.
+    """
+    i = torch.arange(num_classes, device=device)
+    j = torch.arange(num_classes, device=device)
+    d = torch.abs(i[:, None] - j[None, :])  # Distance between states
+
+    # Gaussian kernel adjusted by m
+    K = torch.exp(-0.5 * (d / sigma)**2)
+    S = K * m[None, :]  # Broadcast m across rows
+    S = S / S.sum(dim=-1, keepdim=True)  # Row-normalize to ensure S is a valid transition matrix
+
+    return S  # (C, C)
+
 # ----------------------------------------- probability helper ---------------------------------------- # 
 def sample_uniform_categorical(x_shape, num_classes, device="cuda"):
     return torch.randint(num_classes, size=x_shape, device = device)
@@ -118,26 +137,23 @@ def noise_schedule(t_step,
     return alphabar_t, beta_t
 
 class UnifiedDiscreteDiffusion:
-    """
-    Unified discrete-time and continuous-time discrete diffusion model.
-    The code is closely following the paper's notation and implementation.
-    Understanding the paper's equations is necessary to follow the code.
-    We work with categorical labels directly, instead of one-hot representation. 
-
-    - Notice that the 'conditional_mask' argument is used for both conditioning and padding part. 
-    """
     def __init__(self, 
                  num_steps, 
                  num_classes, 
                  noise_schedule_type, 
                  noise_schedule_args,
+                 transition_sigma=1.0,  # Controls neighborhood size
+                 transition_beta=0.7,   # Mixing between S and m
                  simplified_max_val=1):
-        self.num_steps = num_steps                      # 0 indicates using continuous-time diffusion 
+        self.num_steps = num_steps
         self.num_classes = num_classes
         self.noise_schedule_type = noise_schedule_type
-        self.noise_schedule_args = noise_schedule_args  # args passed to noise_schedule
+        self.noise_schedule_args = noise_schedule_args
+        self.transition_sigma = transition_sigma
+        self.transition_beta = transition_beta
         self.simplified_max_val = simplified_max_val
-        
+
+  
     @torch.no_grad()
     def get_alphabar_beta(self, t, s=None): 
         """
@@ -204,89 +220,120 @@ class UnifiedDiscreteDiffusion:
     
     @torch.no_grad()
     def qt_0_sample(self, x_0, t, m=None, conditional_mask=None):
-        """ forward sampling
+        """
         x_0: (B, N1, ..., Nk)
         t  : (B,)
         m  : (B, N1, ..., Nk, C), or None, or (C)
         conditional_mask : (B, N1, ..., Nk) or None
         """
-        assert x_0.dim() >= 2
         sample_shape = x_0.shape
-        alphabar_t, _ = self.get_alphabar_beta(t)  
-        alphabar_t = alphabar_t.view([-1]+[1]*(x_0.dim()-1)) #B,N1,....Nk
-        #fast sampling from Cat(m)
+        alphabar_t, _ = self.get_alphabar_beta(t)
+        alphabar_t = alphabar_t.view([-1] + [1] * (x_0.dim() - 1))  # B, N1, ..., Nk
+
         if m is None:
-            m0 = sample_uniform_categorical(sample_shape, self.num_classes, device=x_0.device) # x_0 shape
+            m = torch.full((self.num_classes,), 1/self.num_classes, device=x_0.device)
         elif m.dim() == 1:
-            # sample B x N1 x ... x Nk times with replacement. 
-            m0 = torch.multinomial(m, num_samples=sample_shape.numel(), replacement=True).view(sample_shape)
+            m = m.to(x_0.device)
         else:
-            assert m.shape[:-1] == sample_shape and m.shape[-1] == self.num_classes
-            m0 = sample_categorical(m)
-        #sample from the branch indicator function
-        bt = sample_bernoulli(alphabar_t, sample_shape, device=x_0.device) # x_0 shape
-        #sample of size BxD
+            m = m.mean(dim=tuple(range(m.dim() - 1)))  # Average over spatial dimensions
+
+        # Create structured transition matrix S
+        S = create_structured_transition_matrix(self.num_classes, m, self.transition_sigma, x_0.device)
+
+        # Combine S and m
+        transition_mix = (1 - self.transition_beta) * S + self.transition_beta * m[None, :]
+
+        # Sample from the combined distribution
+        m0 = sample_categorical(transition_mix[x_0])
+
+        # Sample from the branch indicator function
+        bt = sample_bernoulli(alphabar_t, sample_shape, device=x_0.device)
+
+        # Sample of size BxD
         sample = torch.where(bt, x_0, m0)
+
         if conditional_mask is not None:
             assert conditional_mask.shape == x_0.shape
             sample[conditional_mask] = x_0[conditional_mask]
+
         return sample
-    
-    @torch.no_grad() ### ONLY used in continuous-time case
+        
+    @torch.no_grad()
     def qt_0_prob(self, x_0, t, m=None, return_beta=False):
         """
         x_0: (B, N1, ..., Nk)
         t  : (B,)
         m  : (B, N1, ..., Nk, C) or None or (C)
         """
-        shape = [-1]+[1]*(x_0.dim()) #B, 1, ..., 1_k, 1
+        shape = [-1] + [1] * (x_0.dim())  # B, 1, ..., 1_k, 1
         alphabar_t, beta_t = self.get_alphabar_beta(t)
         alphabar_t, beta_t = alphabar_t.view(shape), beta_t.view(shape)
+
         if m is None:
-            m = torch.full_like(x_0, 1/self.num_classes, dtype=torch.float32).unsqueeze(-1).repeat_interleave(self.num_classes,-1)
+            m = torch.full((self.num_classes,), 1/self.num_classes, device=x_0.device)
         elif m.dim() == 1:
-            m = torch.broadcast_to(m, list(x_0.shape)+[self.num_classes])
-        
-        prob = (1-alphabar_t) * m
-        prob = set_last_dim(prob, x_0, value=alphabar_t.squeeze(-1), inplace_add=True)
+            m = m.to(x_0.device)
+        else:
+            m = m.mean(dim=tuple(range(m.dim() - 1)))  # Average over spatial dimensions
+
+        # Create structured transition matrix S
+        S = create_structured_transition_matrix(self.num_classes, m, self.transition_sigma, x_0.device)
+
+        # Combine S and m
+        transition_mix = (1 - self.transition_beta) * S + self.transition_beta * m[None, :]
+
+        # Compute full probability
+        prob = (1 - alphabar_t) * transition_mix[x_0]  # (B, N1, ..., Nk, C)
+        prob = set_last_dim(prob, x_0, alphabar_t.squeeze(-1), inplace_add=True)
+
         if return_beta:
             return prob, beta_t
         return prob
 
     @torch.no_grad()
     def qs_t0_prob(self, x_t, x_0, t, s, m=None):
-        """ forward prob, requires s > 0, t > s
+        """
         x_0: (B, N1, ..., Nk)
         x_t: (B, N1, ..., Nk)
         s  : (B,) > 0 
         t  : (B,) > s
         m  : (B, N1, ..., Nk, C) or None, or (C)
         """
-        shape = [-1]+[1]*(x_0.dim()-1) #B,N1,....Nk
+        shape = [-1] + [1] * (x_0.dim() - 1)  # B, N1, ..., Nk
         alphabar_t, _ = self.get_alphabar_beta(t)
         alphabar_s, _ = self.get_alphabar_beta(s)
         alphabar_t, alphabar_s = alphabar_t.view(shape), alphabar_s.view(shape)
 
+        if m is None:
+            m = torch.full((self.num_classes,), 1/self.num_classes, device=x_0.device)
+        elif m.dim() == 1:
+            m = m.to(x_0.device)
+        else:
+            m = m.mean(dim=tuple(range(m.dim() - 1)))  # Average over spatial dimensions
+
+        # Create structured transition matrix S
+        S = create_structured_transition_matrix(self.num_classes, m, self.transition_sigma, x_0.device)
+
+        # Combine S and m
+        transition_mix = (1 - self.transition_beta) * S + self.transition_beta * m[None, :]
+
+        # Compute probabilities using the combined transition matrix
         mu_alphabar_t_s = self.get_mu_times_alphabar(alphabar_t, alphabar_s)
         mu_t_s = self.get_mu(alphabar_t, alphabar_s)
-        lambda_t_s = self.get_lambda(alphabar_t, alphabar_s, x_t, m) # (B, N1, ..., Nk)
+        lambda_t_s = self.get_lambda(alphabar_t, alphabar_s, x_t, m)
 
-        # compute x_0=x_t prob 
-        prob_eq = lambda_t_s[..., None] 
-        prob_eq = prob_eq * m if m is not None else (prob_eq/self.num_classes).repeat_interleave(self.num_classes,-1) # (B, N1, ..., Nk, C)
+        # Compute x_0 = x_t probability
+        prob_eq = lambda_t_s[..., None] * transition_mix[x_t]
         broadcast_idx = get_broadcast_idx(x_t.shape)
-        prob_eq[broadcast_idx+[x_t]] += 1 - lambda_t_s
+        prob_eq[broadcast_idx + [x_t]] += 1 - lambda_t_s
 
-        # compute x_0!=x_t prob
-        prob_neq = (mu_t_s - mu_alphabar_t_s)[...,None]                             # (B, 1, ..., 1k, 1) 
-        prob_neq = prob_neq * m if m is not None else prob_neq / self.num_classes   # (B, 1, ..., 1k, C) or (B,N1...Nk,C)
-        prob_neq = torch.broadcast_to(prob_neq, list(x_t.shape)+[self.num_classes]).clone() # (B, N1, ..., Nk, C)
+        # Compute x_0 != x_t probability
+        prob_neq = (mu_t_s - mu_alphabar_t_s)[..., None] * transition_mix[x_t]
+        prob_neq[broadcast_idx + [x_t]] += mu_alphabar_t_s
+        prob_neq[broadcast_idx + [x_0]] += 1 - mu_t_s
 
-        prob_neq[broadcast_idx+[x_t]] += torch.broadcast_to(mu_alphabar_t_s, x_t.shape) # mu'shape is (B,1,...,1k)
-        prob_neq[broadcast_idx+[x_0]] += torch.broadcast_to(1-mu_t_s       , x_0.shape)
-        
-        prob = torch.where((x_t==x_0).unsqueeze(-1), prob_eq, prob_neq)
-        return prob 
+        prob = torch.where((x_t == x_0).unsqueeze(-1), prob_eq, prob_neq)
+        return prob
 
     def ps_t_prob(self, fprob_t, x_t, t, s, m=None):
         """ Backward prob, requires s > 0, t > s
