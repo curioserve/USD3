@@ -155,14 +155,16 @@ class UnifiedDiscreteDiffusion:
 
         # Initialize S_t as a learnable parameter
         self.S_t = torch.nn.Parameter(
-            torch.eye(num_classes) + 0.01 * torch.randn(num_classes, num_classes),
+            torch.eye(num_classes) + 0.01 * torch.abs(torch.randn(num_classes, num_classes)),
             requires_grad=True
         )
-        self._normalize_S_t()  # Ensure S_t is a valid transition matrix
+        self._normalize_S_t()
 
     def _normalize_S_t(self):
-        """Normalize S_t to ensure rows sum to 1."""
+        """Ensure S_t is a valid transition matrix (rows sum to 1, no negatives)."""
         with torch.no_grad():
+            # Clamp to avoid negative values and normalize
+            self.S_t.data = torch.clamp(self.S_t.data, min=EPS)
             self.S_t.data = F.normalize(self.S_t.data, p=1, dim=-1)
   
     @torch.no_grad()
@@ -250,10 +252,12 @@ class UnifiedDiscreteDiffusion:
 
         # Use learnable S_t
         S_t = self.S_t.to(x_0.device)
-
+        S_t = torch.clamp(S_t, min=EPS)  # Ensure no negative values
+        S_t = F.normalize(S_t, p=1, dim=-1)  # Re-normalize rows
         # Combine S_t and m
         transition_mix = (1 - self.transition_beta) * S_t + self.transition_beta * m[None, :]
-
+        transition_mix = torch.clamp(transition_mix, min=EPS)
+        transition_mix = F.normalize(transition_mix, p=1, dim=-1)
         # Sample from the combined distribution
         m0 = sample_categorical(transition_mix[x_0])
 
