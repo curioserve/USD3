@@ -136,7 +136,7 @@ def noise_schedule(t_step,
 
     return alphabar_t, beta_t
 
-class UnifiedDiscreteDiffusion:
+class OrdinalUnifiedDiscreteDiffusion:
     def __init__(self, 
                  num_steps, 
                  num_classes, 
